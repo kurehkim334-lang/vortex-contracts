@@ -24,6 +24,13 @@ mod proptest_bond;
 #[cfg(test)]
 mod bench;
 
+// Issue #415: Pure arithmetic helpers (Env-free, Kani-provable).
+pub mod math;
+
+// Issue #415: Kani model-checker harnesses. Only compiled under `kani`.
+#[cfg(kani)]
+mod kani_proofs;
+
 // ─── Protocol Constants (Canonical Block) – Issue #341 ───────────────────────
 // All protocol parameters consolidated here (previously scattered with duplicates).
 // Pick one value for each parameter; new variants take the next free numbers.
