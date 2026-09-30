@@ -1,7 +1,10 @@
-# Security Policy — `vortex-contracts`
+# Bug bounty
 
-> For general vulnerability reporting instructions, see the org-level
-> [SECURITY.md](https://github.com/vortex-protocol/.github/blob/main/SECURITY.md).
+A draft program — in-scope assets, severity tiers, and (unfunded) reward
+bands — is published in
+[`docs/bug-bounty-program.md`](docs/bug-bounty-program.md). It is scoped
+to the Assets at Risk table, Trust Assumptions, and the admin-key
+blast-radius table in this file.
 
 ---
 
@@ -112,6 +115,14 @@ defended by the `IntentNotOpen` guard (idempotent after first call).
 
 ---
 
+### Proof of Reserves
+
+The protocol publishes a **public proof-of-reserves dashboard** (see [`dashboard/`](./dashboard/) and [`docs/proof-of-reserves-dashboard.md`](./docs/proof-of-reserves-dashboard.md)) that reconciles on-chain solver bond totals against this Assets-at-Risk table. This is a **transparency artifact, not an insurance guarantee** — it verifies that collateral is on-chain but does not guarantee solver performance or user fund recovery.
+
+The dashboard is continuously updated and independently reproducible (data sources and queries are published). Users should read this threat model and the FAQ in the dashboard for caveats.
+
+---
+
 ### Admin Key Operational Security (#122)
 
 The `Admin` address is the single most sensitive key in the protocol. It
@@ -119,6 +130,10 @@ controls pause/unpause, fee routing, the destination-token allowlist, the
 source-chain allowlist, and admin rotation. A compromised admin key can halt
 the protocol and redirect all fee and slash proceeds. The recommendations below
 apply before and after mainnet launch.
+
+**Custody transparency:** See [`docs/custody-transparency.md`](./docs/custody-transparency.md)
+for the current custody model (who holds the keys, single-key vs. multisig threshold, and last-verified date).
+This document is updated operationally whenever keys are rotated.
 
 #### Recommended custody model
 
@@ -251,57 +266,54 @@ after a network disruption.  Preserving the fields instead closes both the
 cooldown-bypass and the reputation-reset exploits without restricting the
 deregistration path at all.
 
----
+#### Closed gap: bond withdrawal with active intents (#270)
 
-#### Fee-on-transfer and rebasing tokens (issue #409)
+**Previously:** `withdraw_bond` checked only that the post-withdrawal balance
+stayed at or above `cfg.min_bond`, without checking whether the solver had
+`active_intents > 0`.  A solver holding one or more `Accepted` intents could
+withdraw their bond all the way down to the flat `min_bond` floor, leaving
+those already-accepted intents backed by collateral far below the
+`get_adjusted_min_bond` value that was required to accept them in the first
+place.  This directly undermined the bond's purpose as collateral for in-flight
+obligations.
 
-**Risk:** SEP-41 does not forbid transfer fees, and custom tokens are
-allowlisted as `dst_token` and `bond_token`.  If a fee-on-transfer or rebasing
-token is used for bonds or escrow, the contract records the *requested* transfer
-amount as the liability but the *received* amount is less.  Over time the
-recorded liabilities exceed the real balance, and the last withdrawer cannot be
-paid — a well-known DeFi insolvency class.
+**Example:** A 500 USDC bond can normally accept multiple intents, each
+individually validated at accept-time against `get_adjusted_min_bond` (e.g.,
+150 USDC per intent). The solver could immediately call `withdraw_bond` to
+pull out everything down to `min_bond` (as low as 50 USDC), leaving those
+already-accepted intents backed by 50 USDC total — 67 % under-collateralized
+relative to what was required to accept them.
 
-**Fix — balance-delta accounting (`pull_exact`):** Every inbound transfer *into
-the contract* now measures `balance_after - balance_before` and records the
-actual received value rather than the requested amount.  The helper `pull_exact`
-in `intent_settlement/src/lib.rs` implements this pattern:
+**Fix (conservative bound):** `withdraw_bond` now checks `if record.active_intents > 0`
+before allowing any withdrawal, mirroring `deregister_solver`'s stricter
+all-or-nothing precedent: a solver with any active intents cannot withdraw at
+all.  This is a fail-safe, conservative bound; a more precise per-intent
+collateral-reservation model (informed by issue #60's enumerable-intents view)
+remains a future enhancement but is not necessary for correctness.
 
-```rust
-fn pull_exact(env: &Env, token: &Address, from: &Address, amount: i128) -> i128 {
-    let client = token::Client::new(env, token);
-    let contract = env.current_contract_address();
-    let before = client.balance(&contract);
-    client.transfer(from, &contract, &amount);
-    let after = client.balance(&contract);
-    after - before  // actual received amount
-}
-```
-
-The pattern is applied to:
-
-| Path | Token | Behaviour when delta ≠ requested |
-|---|---|---|
-| `register_solver` / `register_solver_inner` | Bond token | Accepted: stored bond reflects the actual received amount; bond requirements are met against the real balance. |
-| `begin_fill` | `dst_token` (escrow) | Accepted: stored `fill_amount` is corrected to the actual escrowed value; the user is paid what actually arrived. |
-| `open_dispute` (dispute bond) | Bond token | **Rejected**: if `received_bond != DISPUTE_BOND` the call panics with `BondTokenFeeOnTransfer`.  The bond token is admin-set USDC which must not levy a transfer fee; a discrepancy indicates misconfiguration. |
-
-**Direct solver→user fills are exempt:** `fill_intent`'s direct transfer path
-(`solver → user`) is never received by the contract — the user receives whatever
-the token delivers, and no contract-side liability is created for this path.
-This exemption is safe and documented in `fill_intent_inner`.
-
-**Rebasing tokens as bonds:** Rebasing tokens (where balances change without a
-transfer event) are **not supported** for solver bonds.  An operator should
-choose a non-rebasing bond token (e.g. standard USDC) and not allowlist
-rebasing tokens as `AllowedBondToken` entries.  The `pull_exact` pattern
-handles a single transfer correctly but cannot account for autonomous balance
-changes that happen between calls.
+**Trade-off:** A solver who accepts an intent but immediately regrets it must
+wait for that intent to be slashed or expire before withdrawing further bond.
+This is correct behaviour — it prevents gaming the bond floor and ensures
+accepted intents never lack the collateral that was promised at accept-time.
 
 ---
+
+### Bug Bounty Program
+
+Vortex Protocol offers a security bug bounty program for findings in the `intent_settlement` and `proof_registry` contracts. See [`docs/bug-bounty-program.md`](./docs/bug-bounty-program.md) for severity tiers, reward structure, and submission process.
+
+### Incident Response and Postmortem Process
+
+When a P1 incident occurs on mainnet (unexpected pause, admin key transfer, fee recipient change, or `rescue_tokens` invocation), the protocol publishes a postmortem within 5 business days of resolution per [`docs/incident-postmortem-template.md`](./docs/incident-postmortem-template.md) (issue #301). Postmortems include timeline, root cause, impact assessment, and preventive actions tracked as follow-up issues.
+
+**Exception:** If the root cause involves a not-yet-fully-patched vulnerability, an initial postmortem may be published with technical details redacted, followed by a full postmortem within a defined safe-harbor period (typically 30 days).
 
 ### Reporting a Vulnerability
 
 Please do **not** open a public GitHub issue for security vulnerabilities.
 Follow the responsible-disclosure process described in the org-level
 [SECURITY.md](https://github.com/vortex-protocol/.github/blob/main/SECURITY.md).
+
+`REAL_MONEY=false`. No payout is authorized until treasury infrastructure
+is funded. Responsible disclosure still follows the process in this
+document.
