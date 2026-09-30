@@ -114,6 +114,12 @@ pub enum ProofKey {
     /// sequence)` pair has already been processed, regardless of which
     /// `intent_id` it carried.
     SeenVaa(u32, u64),
+    /// Issue #408 — the address allowed to call `configure_chain` and
+    /// `remove_chain` on behalf of `intent_settlement`'s atomic onboarding
+    /// flow. Absent until `set_configurator` is called by the admin.
+    Configurator,
+    /// Issue #408 — the Axelar gateway contract address (set at init).
+    AxelarGateway,
 }
 
 // ─── Data Types ───────────────────────────────────────────────────────────────
@@ -170,6 +176,14 @@ pub enum Error {
     /// The application payload's self-declared `src_chain_id` does not match
     /// the `emitter_chain` the Guardians signed over.
     EmitterChainMismatch = 9,
+    /// Issue #408 — a chain ID that would overflow u16 was supplied.
+    ChainIdOutOfRange = 10,
+    /// Issue #408 — `configure_chain` or `remove_chain` called before
+    /// `set_configurator` has been set.
+    ConfiguratorNotSet = 11,
+    /// Issue #408 — `get_fresh_proof` found a proof that has exceeded
+    /// `PROOF_VALIDITY_WINDOW` since it was received.
+    ProofStale = 12,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -249,6 +263,67 @@ impl ProofRegistry {
     /// The configured Wormhole Core contract address, or `None` before init.
     pub fn get_wormhole_core(env: Env) -> Option<Address> {
         env.storage().instance().get(&ProofKey::WormholeCore)
+    }
+
+    // ── Configurator role (issue #408) ────────────────────────────────────────
+    //
+    // `intent_settlement` calls `configure_chain` / `remove_chain` as part of
+    // its atomic `execute_chain_onboarding` / `execute_chain_offboarding` flow
+    // so that both contracts are updated within the same transaction.  The
+    // admin grants settlement this narrow role via `set_configurator`.
+
+    /// Admin-only: set the address (typically `intent_settlement`) that is
+    /// allowed to call `configure_chain` and `remove_chain`.  Call this once
+    /// after both contracts are deployed.
+    pub fn set_configurator(env: Env, configurator: Address) {
+        Self::require_admin(&env);
+        env.storage()
+            .instance()
+            .set(&ProofKey::Configurator, &configurator);
+        Self::bump_instance_ttl(&env);
+        env.events().publish(
+            (Symbol::new(&env, "configurator_set"),),
+            configurator,
+        );
+    }
+
+    /// Return the current configurator address, or `None` if unset.
+    pub fn get_configurator(env: Env) -> Option<Address> {
+        env.storage().instance().get(&ProofKey::Configurator)
+    }
+
+    /// Configurator-only: register `emitter` as the authorized Wormhole
+    /// emitter for `chain_id`.  Called by `intent_settlement` during
+    /// `execute_chain_onboarding` to atomically configure both contracts.
+    /// Emits `emitter_authorized`.
+    pub fn configure_chain(env: Env, chain_id: u32, emitter: BytesN<32>) {
+        Self::require_configurator(&env);
+        if chain_id > u16::MAX as u32 {
+            panic_with_error!(&env, Error::ChainIdOutOfRange);
+        }
+        env.storage()
+            .instance()
+            .set(&ProofKey::AuthorizedEmitter(chain_id), &emitter);
+        Self::bump_instance_ttl(&env);
+        env.events().publish(
+            (Symbol::new(&env, "emitter_authorized"),),
+            (chain_id, emitter),
+        );
+    }
+
+    /// Configurator-only: remove the authorized emitter for `chain_id`.
+    /// Called by `intent_settlement` during `execute_chain_offboarding`.
+    /// In-flight proofs already stored under `ProofKey::Proof` are unaffected
+    /// — existing `ProofRecord` entries remain readable so any proof received
+    /// before offboarding can still gate a `fill_intent` call that was already
+    /// in flight.  Emits `emitter_removed`.
+    pub fn remove_chain(env: Env, chain_id: u32) {
+        Self::require_configurator(&env);
+        env.storage()
+            .instance()
+            .remove(&ProofKey::AuthorizedEmitter(chain_id));
+        env.events()
+            .publish((Symbol::new(&env, "emitter_removed"),), chain_id);
     }
 
     // ── Message Receipt ───────────────────────────────────────────────────────
@@ -533,6 +608,19 @@ impl ProofRegistry {
             .get(&ProofKey::Admin)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
         admin.require_auth();
+    }
+
+    /// Require that the caller is the registered configurator (typically
+    /// `intent_settlement`). Panics with `ConfiguratorNotSet` when no
+    /// configurator has been registered yet, or with `Unauthorized` when the
+    /// caller does not match the stored address.
+    fn require_configurator(env: &Env) {
+        let configurator: Address = env
+            .storage()
+            .instance()
+            .get(&ProofKey::Configurator)
+            .unwrap_or_else(|| panic_with_error!(env, Error::ConfiguratorNotSet));
+        configurator.require_auth();
     }
 
     /// Read one byte of `bytes`, failing closed with `InvalidPayload` if the

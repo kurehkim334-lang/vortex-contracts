@@ -253,6 +253,53 @@ deregistration path at all.
 
 ---
 
+#### Fee-on-transfer and rebasing tokens (issue #409)
+
+**Risk:** SEP-41 does not forbid transfer fees, and custom tokens are
+allowlisted as `dst_token` and `bond_token`.  If a fee-on-transfer or rebasing
+token is used for bonds or escrow, the contract records the *requested* transfer
+amount as the liability but the *received* amount is less.  Over time the
+recorded liabilities exceed the real balance, and the last withdrawer cannot be
+paid — a well-known DeFi insolvency class.
+
+**Fix — balance-delta accounting (`pull_exact`):** Every inbound transfer *into
+the contract* now measures `balance_after - balance_before` and records the
+actual received value rather than the requested amount.  The helper `pull_exact`
+in `intent_settlement/src/lib.rs` implements this pattern:
+
+```rust
+fn pull_exact(env: &Env, token: &Address, from: &Address, amount: i128) -> i128 {
+    let client = token::Client::new(env, token);
+    let contract = env.current_contract_address();
+    let before = client.balance(&contract);
+    client.transfer(from, &contract, &amount);
+    let after = client.balance(&contract);
+    after - before  // actual received amount
+}
+```
+
+The pattern is applied to:
+
+| Path | Token | Behaviour when delta ≠ requested |
+|---|---|---|
+| `register_solver` / `register_solver_inner` | Bond token | Accepted: stored bond reflects the actual received amount; bond requirements are met against the real balance. |
+| `begin_fill` | `dst_token` (escrow) | Accepted: stored `fill_amount` is corrected to the actual escrowed value; the user is paid what actually arrived. |
+| `open_dispute` (dispute bond) | Bond token | **Rejected**: if `received_bond != DISPUTE_BOND` the call panics with `BondTokenFeeOnTransfer`.  The bond token is admin-set USDC which must not levy a transfer fee; a discrepancy indicates misconfiguration. |
+
+**Direct solver→user fills are exempt:** `fill_intent`'s direct transfer path
+(`solver → user`) is never received by the contract — the user receives whatever
+the token delivers, and no contract-side liability is created for this path.
+This exemption is safe and documented in `fill_intent_inner`.
+
+**Rebasing tokens as bonds:** Rebasing tokens (where balances change without a
+transfer event) are **not supported** for solver bonds.  An operator should
+choose a non-rebasing bond token (e.g. standard USDC) and not allowlist
+rebasing tokens as `AllowedBondToken` entries.  The `pull_exact` pattern
+handles a single transfer correctly but cannot account for autonomous balance
+changes that happen between calls.
+
+---
+
 ### Reporting a Vulnerability
 
 Please do **not** open a public GitHub issue for security vulnerabilities.

@@ -42,6 +42,17 @@ const PROTOCOL_FEE_BPS: i128 = 5; // 0.05%
 /// always economically punished.
 const SLASH_BPS: i128 = 1_000; // 10%
 
+/// Issue #420 — grace period added to the fill deadline before `slash_solver`
+/// may execute. This absorbs the worst-case ledger close-time drift on
+/// Stellar (up to ±7 s per ledger, documented in
+/// `docs/420-ledger-time-skew-analysis.md`).
+///
+/// A solver whose fill transaction lands in a ledger whose close time is
+/// within `SLASH_GRACE_SECS` of the nominal deadline is protected from being
+/// slashed for that race. The fill window stays at `FILL_WINDOW` — the grace
+/// only widens the slash eligibility window, not the fill eligibility window.
+const SLASH_GRACE_SECS: u64 = 10; // 2 × worst-case ledger gap (~5 s)
+
 /// Issue #188 — dispute-resolution flow (docs/dispute-resolution-design.md).
 ///
 /// `DISPUTE_WINDOW` is the period, starting at `begin_fill`, during which the
@@ -62,23 +73,12 @@ const ARBITER_WINDOW: u64 = 86_400; // 24 hours
 const MAX_BOND_TOKENS: u32 = 8;
 
 /// Dispute-resolution parameters (issue #48, #233):
-/// When a solver delivers tokens (begin_fill), the user has DISPUTE_WINDOW seconds
-/// to open a dispute. If no dispute is raised, release_fill() can execute after
-/// the window closes. If a dispute is raised, the arbiter has ARBITER_WINDOW
-/// seconds to resolve it; if unresolved, the timeout releases escrow to the user.
-const DISPUTE_WINDOW: u64 = 3600; // 1 hour: time for user to notice and contest fill
-const ARBITER_WINDOW: u64 = 86400; // 24 hours: time for arbiter to resolve
+/// Anti-griefing bond a user must post when calling `open_dispute` / `dispute_fill`.
 const DISPUTE_BOND: i128 = 1 * 10_000_000; // 1 USDC: anti-griefing bond from user
 
 /// Upper bound on the number of intent IDs `list_open_intents` returns per
 /// call (issue #249), bounding the resource cost of paginated reads.
 const MAX_PAGE_SIZE: u32 = 100;
-
-/// After being slashed a solver must wait this many seconds before they can
-/// accept new intents. Used by `accept_intent`'s cooldown guard and by
-/// `get_slash_cooldown_remaining` (issue #256), which both derive from the
-/// same `slash_cooldown_remaining` helper so they can never disagree.
-const SLASH_COOLDOWN: u64 = 3600; // 1 hour
 
 /// Upper bound on the number of `src_chain`/`dst_token` entries a solver may
 /// declare via `set_solver_routes` (issue #255), to keep per-solver route
@@ -92,26 +92,6 @@ const MAX_ROUTE_ENTRIES: u32 = 20;
 /// so off-chain monitors get advance notice even before the delay elapses
 /// (#116).
 const ADMIN_TIMELOCK_DELAY: u64 = 172_800; // 48 hours
-
-// ── Defaults seeded into `ProtocolConfig` by `initialize`, and the fallback
-// `load_config` returns for contracts deployed before the configurable-params
-// feature existed.  They mirror the historical compile-time constants above.
-const DEFAULT_MIN_BOND: i128 = MIN_BOND;
-const DEFAULT_FILL_WINDOW: u64 = FILL_WINDOW;
-const DEFAULT_INTENT_EXPIRY: u64 = INTENT_EXPIRY;
-const DEFAULT_PROTOCOL_FEE_BPS: i128 = PROTOCOL_FEE_BPS;
-
-// ── `set_config` bounds.  A parameter outside any of these ranges is rejected
-// with `Error::InvalidConfig`.
-const MAX_PROTOCOL_FEE_BPS: i128 = 1_000; // 10% hard cap on the protocol fee
-const MIN_FILL_WINDOW_SECS: u64 = 60; // a solver needs at least a minute to fill
-const MIN_INTENT_EXPIRY_SECS: u64 = 300; // and must always exceed the fill window
-const MIN_BOND_FLOOR: i128 = 10_000_000; // one 7-decimal USDC unit
-
-// ── Cooldowns / limits enforced outside `ProtocolConfig`.
-const SLASH_COOLDOWN: u64 = 3600; // 1 hour a slashed solver must wait before accepting again
-const CANCEL_COOLDOWN: u64 = 3600; // 1 hour between a user's successive intent cancellations
-const MAX_EXTENSION_DURATION: u64 = 300; // one extra fill window granted by `request_extension`
 
 // ── Storage-migration schema version (#194). Bumped whenever a `migrate()`
 // body is added for a new release; `initialize` stamps fresh deploys with the
@@ -133,14 +113,6 @@ const BPS_DENOMINATOR: i128 = 10_000;
 // economically implausible threshold: 10^30 (one trillion 18-decimal tokens).
 // That is a comfortable safety margin while rejecting only fat-fingered inputs.
 pub const MAX_AMOUNT: i128 = 1_000_000_000_000_000_000_000_000_000_000i128; // 10^30
-
-const MAX_BATCH_SIZE: u32 = 100;
-const MAX_EXTENSION_DURATION: u64 = 600; // 10 minutes
-
-const DEFAULT_MIN_BOND: i128 = MIN_BOND;
-const DEFAULT_FILL_WINDOW: u64 = FILL_WINDOW;
-const DEFAULT_INTENT_EXPIRY: u64 = INTENT_EXPIRY;
-const DEFAULT_PROTOCOL_FEE_BPS: i128 = PROTOCOL_FEE_BPS;
 
 // Soroban archives ledger entries that go too long without being touched.
 // Persistent Intent/Solver records get their TTL bumped on every write so
@@ -402,9 +374,51 @@ pub enum DataKey {
     /// touches this key, so proof-gating is fully opt-in and defaults off
     /// exactly like `DstAllowlistEnabled`.
     ProofRegistry,
+
+    // ── Issue #408 — atomic chain onboarding ─────────────────────────────────
+
+    /// **Instance storage.** Pending `propose_chain_onboarding` proposal:
+    /// maps a chain name (`String`) to `(ChainConfig, eta: u64)` where `eta`
+    /// is the earliest ledger timestamp at which `execute_chain_onboarding`
+    /// may apply it.
+    PendingChainOnboarding(String),
+
+    /// **Instance storage.** Live `ChainConfig` for a chain that has been
+    /// fully onboarded via `execute_chain_onboarding`.  Keyed by canonical
+    /// chain name (e.g. `"ethereum"`).  Absent for chains that have never
+    /// been onboarded or have been removed via `execute_chain_offboarding`.
+    ChainConfig(String),
 }
 
 // ─── Data Structs ─────────────────────────────────────────────────────────────
+
+/// Issue #408 — full configuration bundle for a single source chain.
+///
+/// `propose_chain_onboarding` queues this struct under a timelock;
+/// `execute_chain_onboarding` applies it atomically to both
+/// `intent_settlement` (src-chain allowlist) and `proof_registry`
+/// (authorized emitter).
+///
+/// **Fields:**
+/// * `name`         — canonical lowercase string used in `submit_intent`'s
+///                    `src_chain` field (e.g. `"ethereum"`).
+/// * `wormhole_id`  — Wormhole chain ID (e.g. 2 for Ethereum).
+/// * `axelar_name`  — Axelar source-chain identifier string (e.g. `"Ethereum"`).
+/// * `emitter`      — 32-byte Wormhole emitter address for this chain.
+/// * `axelar_source`— Axelar source-contract address string.
+/// * `token_format` — human-readable description of the `src_token` format
+///                    (e.g. `"0x-prefixed 40-char hex"`); stored for reference,
+///                    not validated on-chain.
+#[contracttype]
+#[derive(Clone)]
+pub struct ChainConfig {
+    pub name: String,
+    pub wormhole_id: u32,
+    pub axelar_name: String,
+    pub emitter: BytesN<32>,
+    pub axelar_source: String,
+    pub token_format: String,
+}
 
 /// Admin-configurable protocol parameters.  Stored as a single instance-storage
 /// entry so all values are read/written atomically.
@@ -756,6 +770,25 @@ pub enum Error {
     /// submitting `user`.  Self-referral is rejected to prevent a user from
     /// gaming the referral programme by naming their own address.
     SelfReferral = 35,
+
+    // ── Issue #408 — atomic chain onboarding ─────────────────────────────────
+
+    /// `execute_chain_onboarding` was called with no matching pending proposal.
+    NoPendingChainOnboarding = 36,
+    /// A chain onboarding / offboarding admin action was performed on a chain
+    /// that is already in the target state (already onboarded or not present).
+    ChainAlreadyConfigured = 37,
+    /// `execute_chain_offboarding` was called for a chain that is not
+    /// currently onboarded.
+    ChainNotConfigured = 38,
+
+    // ── Issue #409 — balance-delta accounting ─────────────────────────────────
+
+    /// The dispute bond token charged a transfer fee (received amount ≠
+    /// requested amount).  The bond token must be a non-fee-on-transfer token;
+    /// this error signals a misconfiguration.  Documented in SECURITY.md
+    /// §Fee-on-transfer tokens.
+    BondTokenFeeOnTransfer = 39,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -1396,6 +1429,150 @@ impl IntentSettlement {
             .unwrap_or(false)
     }
 
+    // ── Atomic chain onboarding (issue #408) ──────────────────────────────────
+    //
+    // Adding a new source chain today requires multiple separate admin
+    // operations across two contracts: `add_allowed_src_chain`,
+    // `set_authorized_emitter` on proof_registry, Axelar source config, and
+    // token-format rules.  A partial configuration leaves the chain
+    // half-enabled — intents can be submitted but fills fail with proof
+    // errors and the intents are slashed or expire.
+    //
+    // `propose_chain_onboarding` / `execute_chain_onboarding` bundle all
+    // changes into one timelocked proposal that is applied atomically in a
+    // single transaction (settlement calls the registry as the configurator).
+    //
+    // **Offboarding behaviour:** `execute_chain_offboarding` removes the chain
+    // from the allowlist and strips the authorized emitter.  In-flight intents
+    // that were already submitted and accepted are *unaffected* — the intent's
+    // `src_chain` field is informational and the fill path does not re-validate
+    // it against the allowlist.  Proofs already stored in the registry remain
+    // readable.  Operators should wait for all open intents on the offboarded
+    // chain to resolve before removing the chain.
+
+    /// Admin-only: queue a full source-chain onboarding bundle under a
+    /// 48-hour timelock.  A new proposal for the same chain overwrites any
+    /// prior pending proposal (and resets the clock), so the admin can
+    /// correct a misconfiguration before execution.
+    ///
+    /// Emits `chain_onboarding_proposed(name, wormhole_id, eta)`.
+    pub fn propose_chain_onboarding(env: Env, config: ChainConfig) {
+        Self::require_admin(&env);
+        let eta = env.ledger().timestamp() + ADMIN_TIMELOCK_DELAY;
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingChainOnboarding(config.name.clone()), &(config.clone(), eta));
+        Self::bump_instance_ttl(&env);
+        env.events().publish(
+            (Symbol::new(&env, "chain_onboarding_proposed"),),
+            (config.name, config.wormhole_id, eta),
+        );
+    }
+
+    /// Admin-only: execute a pending chain-onboarding proposal once the
+    /// 48-hour timelock has elapsed.  Applies all changes atomically:
+    ///
+    /// 1. Adds `config.name` to the src-chain allowlist.
+    /// 2. Calls `proof_registry.configure_chain(wormhole_id, emitter)` so the
+    ///    registry authorizes VAAs from this chain in the same transaction.
+    /// 3. Writes a live `ChainConfig` entry for `get_chain_config`.
+    ///
+    /// Panics with `NoPendingChainOnboarding` if no proposal exists,
+    /// `TimelockNotElapsed` if the delay hasn't passed, or
+    /// `ChainAlreadyConfigured` if the chain is already active.
+    ///
+    /// Emits `chain_onboarding_executed(name, wormhole_id)`.
+    pub fn execute_chain_onboarding(env: Env, name: String) {
+        Self::require_admin(&env);
+
+        let (config, eta): (ChainConfig, u64) = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingChainOnboarding(name.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingChainOnboarding));
+
+        if env.ledger().timestamp() < eta {
+            panic_with_error!(&env, Error::TimelockNotElapsed);
+        }
+
+        if env.storage().instance().has(&DataKey::ChainConfig(name.clone())) {
+            panic_with_error!(&env, Error::ChainAlreadyConfigured);
+        }
+
+        // 1. Add to the src-chain allowlist.
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowedSrcChain(config.name.clone()), &true);
+
+        // 2. Configure the proof registry (cross-contract call).
+        //    The registry must have called set_configurator(this_contract) first.
+        if let Some(registry_addr) = env.storage().instance().get::<_, Address>(&DataKey::ProofRegistry) {
+            let registry = vortex_proof_registry::ProofRegistryClient::new(&env, &registry_addr);
+            registry.configure_chain(&config.wormhole_id, &config.emitter);
+        }
+
+        // 3. Persist the live config and remove the pending proposal.
+        env.storage()
+            .instance()
+            .set(&DataKey::ChainConfig(config.name.clone()), &config);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingChainOnboarding(name.clone()));
+
+        Self::bump_instance_ttl(&env);
+        env.events().publish(
+            (Symbol::new(&env, "chain_onboarding_executed"),),
+            (config.name, config.wormhole_id),
+        );
+    }
+
+    /// Admin-only: remove a previously onboarded chain.  Strips it from the
+    /// allowlist and from the proof registry's emitter table in one call.
+    ///
+    /// In-flight intents already submitted for this chain are not affected —
+    /// the src-chain field is validated only at submission time, not at fill
+    /// time.  Documented in `docs/132-supported-chains.md §6`.
+    ///
+    /// Panics with `ChainNotConfigured` if the chain is not currently active.
+    /// Emits `chain_offboarding_executed(name)`.
+    pub fn execute_chain_offboarding(env: Env, name: String) {
+        Self::require_admin(&env);
+
+        let config: ChainConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::ChainConfig(name.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ChainNotConfigured));
+
+        // Remove from allowlist.
+        env.storage()
+            .instance()
+            .remove(&DataKey::AllowedSrcChain(name.clone()));
+
+        // Remove from proof registry.
+        if let Some(registry_addr) = env.storage().instance().get::<_, Address>(&DataKey::ProofRegistry) {
+            let registry = vortex_proof_registry::ProofRegistryClient::new(&env, &registry_addr);
+            registry.remove_chain(&config.wormhole_id);
+        }
+
+        // Remove the live config entry.
+        env.storage()
+            .instance()
+            .remove(&DataKey::ChainConfig(name.clone()));
+
+        Self::bump_instance_ttl(&env);
+        env.events().publish(
+            (Symbol::new(&env, "chain_offboarding_executed"),),
+            name,
+        );
+    }
+
+    /// View: return the live `ChainConfig` for `name`, or `None` if the chain
+    /// has not been onboarded (or has been offboarded).
+    pub fn get_chain_config(env: Env, name: String) -> Option<ChainConfig> {
+        env.storage().instance().get(&DataKey::ChainConfig(name))
+    }
+
     // ── Pause Control ─────────────────────────────────────────────────────────
 
     /// Admin-only: designate (or rotate) the address that may call `pause`
@@ -1642,9 +1819,20 @@ impl IntentSettlement {
             Self::add_to_solver_list(&env, &solver);
         }
 
-        // ── Interaction: pull bond in ────────────────────────────────────────
-        let client = token::Client::new(&env, &bond_token);
-        client.transfer(&solver, &env.current_contract_address(), &bond_amount);
+        // ── Interaction: pull bond in (balance-delta, #409) ──────────────────
+        // Use pull_exact to measure the actual received amount so fee-on-
+        // transfer bond tokens don't create a fictitious liability.
+        let received = Self::pull_exact(&env, &bond_token, &solver, bond_amount);
+        // Re-derive new_bond using the actual received delta rather than the
+        // requested bond_amount, then re-apply to the record already persisted.
+        if received != bond_amount {
+            // Correct the stored bond for the fee discrepancy.
+            let corrected = existing_bond + received;
+            Self::set_solver_bond_amount(&env, &mut record, &bond_token, corrected);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Solver(solver.clone()), &record);
+        }
 
         env.events().publish(
             (Symbol::new(&env, "solver_registered"), solver),
@@ -2035,6 +2223,12 @@ impl IntentSettlement {
     /// Issue #187: thin wrapper over `accept_intent_with_bond` pinned to the
     /// legacy default bond token.
     pub fn accept_intent(env: Env, solver: Address, intent_id: BytesN<32>) {
+        // Auth audit (#411): scoped to (intent_id,) so a delegated-execution
+        // invoker cannot redirect the solver's signed authorization to a
+        // different intent than the one they chose to accept.
+        solver.require_auth_for_args(
+            (intent_id.clone(),).into_val(&env),
+        );
         let bond_token = Self::load_bond_token(&env);
         Self::accept_intent_inner(env, solver, intent_id, bond_token);
     }
@@ -2048,6 +2242,11 @@ impl IntentSettlement {
         intent_id: BytesN<32>,
         bond_token: Address,
     ) {
+        // Auth audit (#411): scoped to (intent_id, bond_token) so the solver's
+        // signed authorization cannot be redirected to a different intent.
+        solver.require_auth_for_args(
+            (intent_id.clone(), bond_token.clone()).into_val(&env),
+        );
         Self::accept_intent_inner(env, solver, intent_id, bond_token);
     }
 
@@ -2057,16 +2256,16 @@ impl IntentSettlement {
         intent_id: BytesN<32>,
         bond_token: Address,
     ) {
-        // Auth audit: require_auth() is correct. The solver must sign to
-        // voluntarily take on the fill obligation and bond risk.
-        solver.require_auth();
-        Self::accept_intent_inner(env, solver, intent_id);
+        // Both `accept_intent` and `accept_intent_with_bond` have already called
+        // `require_auth_for_args` before reaching here (#411).  No additional
+        // `require_auth` call is needed in this body.
+        Self::accept_intent_body(env, solver, intent_id, bond_token);
     }
 
-    /// Body of `accept_intent` without the `solver.require_auth()` gate. Shared
+    /// Body of `accept_intent` without the `solver.require_auth*` gate. Shared
     /// with `batch_accept_intent`, which authorises the solver once per batch
-    /// (`require_auth()` is one-shot per address per invocation).
-    fn accept_intent_inner(env: Env, solver: Address, intent_id: BytesN<32>) {
+    /// (`require_auth_for_args` is one-shot per address per invocation).
+    fn accept_intent_body(env: Env, solver: Address, intent_id: BytesN<32>, bond_token: Address) {
         Self::require_not_paused(&env);
         Self::bump_instance_ttl(&env);
 
@@ -2204,14 +2403,17 @@ impl IntentSettlement {
         fill_amount: i128,
         require_proof: bool,
     ) {
-        // Auth audit: require_auth() is correct. The solver must sign to
-        // authorise the token transfer from their address to the user and fee
-        // recipient. This is the highest-value call site: the solver authorises
-        // a token transfer, so the auth is load-bearing. require_auth_for_args
-        // scoped to (solver, intent_id, fill_amount) would meaningfully tighten
-        // the scope if a delegated-execution pattern is ever introduced — noted
-        // as the strongest candidate for future hardening.
-        solver.require_auth();
+        // Auth audit (#411): scoped to (solver, intent_id, fill_amount) — the
+        // highest-value call site in the contract.  The solver authorises a
+        // token transfer, so this auth is load-bearing.  Scoping to the solver
+        // address, intent ID, and fill amount ensures a relayer or delegating
+        // invoker cannot redirect the solver's signed authorization to a
+        // different intent or a different fill amount than those the solver
+        // explicitly approved.  The solver address is included so the auth
+        // entry is globally unique across contracts, not just within this one.
+        solver.require_auth_for_args(
+            (solver.clone(), intent_id.clone(), fill_amount).into_val(&env),
+        );
         Self::fill_intent_inner(env, solver, intent_id, fill_amount);
     }
 
@@ -2227,11 +2429,11 @@ impl IntentSettlement {
         let mut intent = Self::load_intent(&env, &intent_id);
 
         let now = env.ledger().timestamp();
-        // Boundary semantics: the fill-window deadline is EXCLUSIVE for filling.
-        // `now >= intent.deadline` rejects at the boundary second (`now == deadline`)
-        // so the full [accepted_at, accepted_at + FILL_WINDOW) window is available
-        // to the solver. Shared with `is_intent_fillable` via `check_fill_guards`
-        // (issue #259) so the two can never silently drift apart.
+        // Boundary semantics (#420): fill-window deadline is EXCLUSIVE — the
+        // `fill_window_open` helper enforces `now < deadline`.  Using the named
+        // helper (rather than an inline comparison) ensures this call site and
+        // `is_intent_fillable` / `check_fill_guards` can never silently drift
+        // apart. Issue #259 documents this sharing contract.
         if let Err(e) = Self::check_fill_guards(&intent, &solver, now) {
             panic_with_error!(&env, e);
         }
@@ -2345,6 +2547,15 @@ impl IntentSettlement {
         // ── Interactions: token transfers (state already committed above) ────
         // Solver delivers this fill's output to the user, then separately pays
         // the protocol fee. Each transfer happens exactly once.
+        //
+        // Issue #409 exemption: direct solver→user fills are NOT wrapped in
+        // `pull_exact` because the contract is never the receiver of these
+        // tokens — the user gets whatever the token delivers, and our contract
+        // never records a balance-based liability for this path.  The balance-
+        // delta pattern is only needed for inbound transfers *into* the contract
+        // (bonds via `register_solver`, escrow via `begin_fill`, dispute bonds
+        // via `open_dispute`).  This exemption is documented in SECURITY.md
+        // §Fee-on-transfer tokens.
         let dst_client = token::Client::new(&env, &intent.dst_token);
 
         // Solver delivers the full requested output to the user.
@@ -2469,228 +2680,6 @@ impl IntentSettlement {
             intent_id.clone(),
         );
     }
-
-    /// Solver begins fill by depositing dst_token into escrow. Starts dispute window.
-    /// Replaces the direct transfer in fill_intent once this design is implemented.
-    /// For now, this is a placeholder establishing the interface.
-    pub fn begin_fill(env: Env, solver: Address, intent_id: BytesN<32>, fill_amount: i128) {
-        solver.require_auth();
-        Self::require_not_paused(&env);
-        Self::bump_instance_ttl(&env);
-
-        let mut intent: IntentRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Intent(intent_id.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::IntentNotFound));
-
-        if intent.solver.as_ref() != Some(&solver) {
-            panic_with_error!(&env, Error::Unauthorized);
-        }
-
-        if intent.state != IntentState::Accepted {
-            panic_with_error!(&env, Error::IntentNotAccepted);
-        }
-
-        let now = env.ledger().timestamp();
-        if now >= intent.deadline {
-            panic_with_error!(&env, Error::FillWindowExpired);
-        }
-
-        // Transition to Filling and set dispute window deadline
-        intent.state = IntentState::Filling;
-        intent.dispute_deadline = Some(now + DISPUTE_WINDOW);
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Intent(intent_id.clone()), &intent);
-        Self::bump_intent_ttl(&env, &intent_id);
-
-        env.events().publish(
-            (Symbol::new(&env, "fill_begun"),),
-            (intent_id, solver, fill_amount),
-        );
-    }
-
-    /// User opens a dispute within the dispute window. Requires paying a bond.
-    /// Transitions intent to Disputed state.
-    pub fn open_dispute(env: Env, user: Address, intent_id: BytesN<32>) {
-        user.require_auth();
-        Self::bump_instance_ttl(&env);
-
-        let mut intent: IntentRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Intent(intent_id.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::IntentNotFound));
-
-        if intent.user != user {
-            panic_with_error!(&env, Error::Unauthorized);
-        }
-
-        if intent.state != IntentState::Filling {
-            panic_with_error!(&env, Error::NoDisputeOpen);
-        }
-
-        let now = env.ledger().timestamp();
-        if let Some(deadline) = intent.dispute_deadline {
-            if now >= deadline {
-                panic_with_error!(&env, Error::DisputeWindowExpired);
-            }
-        } else {
-            panic_with_error!(&env, Error::NoFillEscrowed);
-        }
-
-        // Pull dispute bond from user
-        let bond_token: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::BondToken)
-            .unwrap();
-        let bond_client = token::Client::new(&env, &bond_token);
-        bond_client.transfer_from(&user, &env.current_contract_address(), &user, &DISPUTE_BOND);
-
-        intent.state = IntentState::Disputed;
-        intent.dispute_raised_at = Some(now);
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Intent(intent_id.clone()), &intent);
-        Self::bump_intent_ttl(&env, &intent_id);
-
-        env.events().publish(
-            (Symbol::new(&env, "dispute_opened"),),
-            (intent_id, user),
-        );
-    }
-
-    /// Arbiter resolves a dispute. Transitions intent to Resolved and handles bond/escrow.
-    pub fn resolve_dispute(
-        env: Env,
-        arbiter: Address,
-        intent_id: BytesN<32>,
-        resolution: DisputeResolution,
-    ) {
-        arbiter.require_auth();
-        Self::bump_instance_ttl(&env);
-
-        // For now, arbiter is the admin. In v2, this could be a separate arbiter role.
-        Self::require_admin(&env);
-
-        let mut intent: IntentRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Intent(intent_id.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::IntentNotFound));
-
-        if intent.state != IntentState::Disputed {
-            panic_with_error!(&env, Error::NoDisputeOpen);
-        }
-
-        let now = env.ledger().timestamp();
-        if let Some(raised_at) = intent.dispute_raised_at {
-            if now >= raised_at + ARBITER_WINDOW {
-                panic_with_error!(&env, Error::ArbiterWindowExpired);
-            }
-        } else {
-            panic_with_error!(&env, Error::NoDisputeOpen);
-        }
-
-        let bond_token: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::BondToken)
-            .unwrap();
-        let bond_client = token::Client::new(&env, &bond_token);
-
-        intent.state = IntentState::Resolved;
-        intent.resolution = Some(resolution.clone());
-
-        match resolution {
-            DisputeResolution::Upheld => {
-                // Refund bond to user, slash solver
-                bond_client.transfer(&env.current_contract_address(), &intent.user, &DISPUTE_BOND);
-
-                if let Some(solver) = &intent.solver {
-                    // Slash solver's bond
-                    let mut solver_record: SolverRecord = env
-                        .storage()
-                        .persistent()
-                        .get(&DataKey::Solver(solver.clone()))
-                        .unwrap();
-                    let slash_amount = solver_record.bond_amount / 10;
-                    solver_record.bond_amount = solver_record.bond_amount.saturating_sub(slash_amount);
-                    env.storage()
-                        .persistent()
-                        .set(&DataKey::Solver(solver.clone()), &solver_record);
-                    Self::bump_solver_ttl(&env, solver);
-
-                    // Transfer slashed bond to fee recipient
-                    let fee_recipient: Address = env
-                        .storage()
-                        .instance()
-                        .get(&DataKey::FeeRecipient)
-                        .unwrap();
-                    bond_client.transfer(&env.current_contract_address(), &fee_recipient, &slash_amount);
-                }
-            }
-            DisputeResolution::Dismissed => {
-                // Forfeit bond to fee recipient
-                let fee_recipient: Address = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::FeeRecipient)
-                    .unwrap();
-                bond_client.transfer(&env.current_contract_address(), &fee_recipient, &DISPUTE_BOND);
-            }
-        }
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Intent(intent_id.clone()), &intent);
-        Self::bump_intent_ttl(&env, &intent_id);
-
-        env.events().publish(
-            (Symbol::new(&env, "dispute_resolved"),),
-            (intent_id, resolution),
-        );
-    }
-
-    /// Permissionless: release escrowed fill after dispute window closes without a dispute.
-    pub fn release_fill(env: Env, intent_id: BytesN<32>) {
-        Self::bump_instance_ttl(&env);
-
-        let mut intent: IntentRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Intent(intent_id.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::IntentNotFound));
-
-        if intent.state != IntentState::Filling {
-            panic_with_error!(&env, Error::NoFillEscrowed);
-        }
-
-        let now = env.ledger().timestamp();
-        if let Some(deadline) = intent.dispute_deadline {
-            if now < deadline {
-                panic_with_error!(&env, Error::DisputeWindowExpired);
-            }
-        } else {
-            panic_with_error!(&env, Error::NoFillEscrowed);
-        }
-
-        // Transition to Filled (this is a simplified version; full impl would handle token release)
-        intent.state = IntentState::Filled;
-        intent.filled_at = Some(now);
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Intent(intent_id.clone()), &intent);
-        Self::bump_intent_ttl(&env, &intent_id);
-
-        env.events().publish((Symbol::new(&env, "fill_released"),), intent_id);
-    }
-
     /// Permissionless: slash a solver that accepted but didn't fill within FILL_WINDOW
     pub fn slash_solver(env: Env, intent_id: BytesN<32>) {
         Self::bump_instance_ttl(&env);
@@ -2703,12 +2692,12 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::IntentNotAccepted);
         }
 
-        // Boundary semantics: the fill-window deadline is INCLUSIVE for slashing.
-        // The guard `now < intent.deadline` is false when `now == deadline`, so
-        // slashing becomes valid at the deadline second itself (not strictly after).
-        // Fill window available to solver: [accepted_at, accepted_at + FILL_WINDOW).
-        // Slash window: [accepted_at + FILL_WINDOW, ∞).
-        if now < intent.deadline {
+        // Boundary semantics (#420): slashing requires now >= deadline + SLASH_GRACE_SECS.
+        // The grace period absorbs ledger close-time drift so a solver whose fill
+        // transaction races the deadline is not slashed unfairly. The fill window
+        // itself is unchanged — fills remain valid until `now < deadline`.
+        // See docs/420-ledger-time-skew-analysis.md for the full analysis.
+        if !Self::slash_eligible(now, intent.deadline) {
             panic_with_error!(&env, Error::FillWindowExpired); // not expired yet
         }
 
@@ -3093,7 +3082,9 @@ impl IntentSettlement {
     /// must bring `total_filled` to at least `min_dst_amount`.  Partial fills
     /// keep using `fill_intent`.
     pub fn begin_fill(env: Env, solver: Address, intent_id: BytesN<32>, fill_amount: i128) {
-        solver.require_auth();
+        solver.require_auth_for_args(
+            (&solver, &intent_id, &fill_amount).into_val(&env),
+        );
         Self::require_not_paused(&env);
         Self::bump_instance_ttl(&env);
 
@@ -3111,8 +3102,8 @@ impl IntentSettlement {
         }
 
         let now = env.ledger().timestamp();
-        // Fill-window deadline is EXCLUSIVE, matching `fill_intent`.
-        if now >= intent.deadline {
+        // Fill-window boundary (#420): fill is valid while fill_window_open.
+        if !Self::fill_window_open(now, intent.deadline) {
             panic_with_error!(&env, Error::FillWindowExpired);
         }
         if fill_amount <= 0 {
@@ -3133,12 +3124,17 @@ impl IntentSettlement {
             .set(&DataKey::Intent(intent_id.clone()), &intent);
         Self::bump_intent_ttl(&env, &intent_id);
 
-        // ── Interaction: pull the output into escrow ─────────────────────────
-        token::Client::new(&env, &intent.dst_token).transfer(
-            &solver,
-            &env.current_contract_address(),
-            &fill_amount,
-        );
+        // ── Interaction: pull the output into escrow (balance-delta, #409) ───
+        // Measure the actual amount received so that on release_fill / resolve_dispute
+        // the user is paid exactly what arrived, not what was requested.
+        let escrowed = Self::pull_exact(&env, &intent.dst_token, &solver, fill_amount);
+        if escrowed != fill_amount {
+            // Correct the stored fill_amount to the actual escrowed value.
+            intent.fill_amount = Some(escrowed);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Intent(intent_id.clone()), &intent);
+        }
 
         env.events().publish(
             (Symbol::new(&env, "fill_begun"), solver),
@@ -3573,10 +3569,15 @@ impl IntentSettlement {
         if intent_ids.len() > MAX_BATCH_SIZE {
             panic_with_error!(&env, Error::BatchTooLarge);
         }
-        solver.require_auth();
+        // Auth audit (#411): scope to the full id list so the solver's sig
+        // cannot be reused for a different set of intents.
+        solver.require_auth_for_args(
+            (intent_ids.clone(),).into_val(&env),
+        );
 
         for intent_id in intent_ids {
-            Self::accept_intent_inner(env.clone(), solver.clone(), intent_id);
+            let bond_token = Self::load_bond_token(&env);
+            Self::accept_intent_inner(env.clone(), solver.clone(), intent_id, bond_token);
         }
     }
 
@@ -3597,7 +3598,12 @@ impl IntentSettlement {
         if fills.len() > MAX_BATCH_SIZE {
             panic_with_error!(&env, Error::BatchTooLarge);
         }
-        solver.require_auth();
+        // Auth audit (#411): scope to the full (intent_id, fill_amount) list so
+        // the solver's signed authorization cannot be replayed for a different
+        // set of intents or amounts than those they actually signed for.
+        solver.require_auth_for_args(
+            (fills.clone(),).into_val(&env),
+        );
 
         for (intent_id, fill_amount) in fills {
             Self::fill_intent_inner(env.clone(), solver.clone(), intent_id, fill_amount);
@@ -3627,50 +3633,6 @@ impl IntentSettlement {
             Self::cancel_intent_core(&env, &user, &intent_id);
         }
         Self::stamp_cancel_cooldown(&env, &user, now);
-    }
-
-    /// Fill multiple intents in a single transaction.
-    ///
-    /// Each element of `fills` is `(intent_id, fill_amount)`.  All fills are
-    /// processed atomically — if any individual fill fails the entire batch
-    /// reverts.
-    ///
-    /// Bounded by [`MAX_BATCH_SIZE`] to prevent resource exhaustion.
-    /// See `docs/149-resource-cost-per-entrypoint.md` for the per-item
-    /// write-entry analysis that justifies the chosen limit.
-    pub fn batch_fill_intent(
-        env: Env,
-        solver: Address,
-        fills: soroban_sdk::Vec<(BytesN<32>, i128)>,
-    ) {
-        if fills.len() > MAX_BATCH_SIZE as usize {
-            panic_with_error!(&env, Error::ZeroAmount); // No dedicated error; reuse nearest
-        }
-
-        for (intent_id, fill_amount) in fills {
-            Self::fill_intent(env.clone(), solver.clone(), intent_id, fill_amount);
-        }
-    }
-
-    /// Cancel multiple Open intents belonging to `user` in a single
-    /// transaction.
-    ///
-    /// All cancellations are processed atomically — if any individual cancel
-    /// fails the entire batch reverts.
-    ///
-    /// Bounded by [`MAX_BATCH_SIZE`] to prevent resource exhaustion.
-    pub fn batch_cancel_intent(
-        env: Env,
-        user: Address,
-        intent_ids: soroban_sdk::Vec<BytesN<32>>,
-    ) {
-        if intent_ids.len() > MAX_BATCH_SIZE as usize {
-            panic_with_error!(&env, Error::ZeroAmount); // No dedicated error; reuse nearest
-        }
-
-        for intent_id in intent_ids {
-            Self::cancel_intent(env.clone(), user.clone(), intent_id);
-        }
     }
 
     // ── Fill Window Extension ─────────────────────────────────────────────────
@@ -4085,13 +4047,6 @@ impl IntentSettlement {
     pub fn get_admin(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::Admin)
     }
-
-    /// Pending admin-transfer proposal, if any: `(new_admin, eta)` where `eta`
-    /// is the ledger timestamp at which `accept_admin_transfer` may execute it.
-    pub fn get_pending_admin(env: Env) -> Option<(Address, u64)> {
-        env.storage().instance().get(&DataKey::PendingAdmin)
-    }
-
 
     ///
     /// - `total_intents` — cumulative count of intents ever submitted.
@@ -4519,6 +4474,39 @@ impl IntentSettlement {
         }
     }
 
+    /// Issue #420 — named boundary: fill window is still open.
+    /// Exclusive upper bound: `now < deadline` is the last moment fills are valid.
+    /// This is the "EXCLUSIVE fill deadline" convention from issue #26.
+    #[inline]
+    fn fill_window_open(now: u64, deadline: u64) -> bool {
+        now < deadline
+    }
+
+    /// Issue #420 — named boundary: slash is eligible.
+    /// A slash may only be executed once `now >= deadline + SLASH_GRACE_SECS`,
+    /// giving the solver a `SLASH_GRACE_SECS`-second buffer to absorb ledger
+    /// close-time drift (see `docs/420-ledger-time-skew-analysis.md`).
+    /// The fill window uses a DIFFERENT boundary (`fill_window_open`) so fills
+    /// remain valid right up to `deadline` while slashing requires `deadline + grace`.
+    #[inline]
+    fn slash_eligible(now: u64, deadline: u64) -> bool {
+        now >= deadline.saturating_add(SLASH_GRACE_SECS)
+    }
+
+    /// Issue #420 — named boundary: dispute window is still open.
+    /// Exclusive: `now < dispute_deadline`.
+    #[inline]
+    fn dispute_window_open(now: u64, dispute_deadline: u64) -> bool {
+        now < dispute_deadline
+    }
+
+    /// Issue #420 — named boundary: arbiter window has elapsed (timeout).
+    /// Inclusive: timeout is reachable at `now == raised_at + ARBITER_WINDOW`.
+    #[inline]
+    fn arbiter_timeout_reached(now: u64, raised_at: u64) -> bool {
+        now >= raised_at.saturating_add(ARBITER_WINDOW)
+    }
+
     /// The pre-transfer guard sequence shared between `fill_intent` and
     /// `is_intent_fillable` (issue #259): intent state is `Accepted`, `solver`
     /// matches `intent.solver`, and `now` is before the fill-window deadline.
@@ -4833,6 +4821,49 @@ impl IntentSettlement {
         proportional.max(1).min(cap)
     }
 
+    /// Issue #409 — balance-delta pull helper.
+    ///
+    /// Transfers `amount` of `token` from `from` into the contract and returns the
+    /// **actual** amount received, measured as `balance_after - balance_before`.
+    ///
+    /// Fee-on-transfer tokens silently reduce the amount that lands in the
+    /// contract; rebasing tokens can change balances between calls. By recording
+    /// the delta rather than the requested `amount`, every inbound accounting
+    /// entry reflects reality.
+    ///
+    /// **Decision per path:**
+    /// * Bond registration / top-up (`register_solver_inner`): fee-on-transfer bonds
+    ///   would mean the solver is recorded as holding more bond than the contract
+    ///   actually has — accept the delta and record only what arrived.
+    ///   Rebasing-up bonds would credit the solver extra without a transfer; they
+    ///   are not supported as bond tokens (admin must not allowlist them).
+    /// * `begin_fill` escrow: same reasoning — record only the escrowed amount that
+    ///   actually landed, which is what the user will receive on `release_fill`.
+    /// * Dispute bond: same — record only what arrived as the dispute collateral.
+    ///
+    /// **Fills paid solver→user directly** (`fill_intent`) are exempt: the
+    /// contract is not the receiver, so there is no balance to measure. The user
+    /// receives whatever the token delivers; that is outside this contract's
+    /// accounting responsibility.
+    ///
+    /// **CEI note:** callers must write all state changes that depend on the
+    /// returned `received` value *after* this call returns, not before. The helper
+    /// itself is read-balance → transfer → read-balance, which is the minimal
+    /// reentrancy surface; the two balance reads bracket a single external call.
+    fn pull_exact(
+        env: &Env,
+        token: &Address,
+        from: &Address,
+        amount: i128,
+    ) -> i128 {
+        let client = token::Client::new(env, token);
+        let contract = env.current_contract_address();
+        let before: i128 = client.balance(&contract);
+        client.transfer(from, &contract, &amount);
+        let after: i128 = client.balance(&contract);
+        after - before
+    }
+
     /// Issue #188 — the address allowed to call `resolve_dispute`: the
     /// `DataKey::Arbiter` entry if set, otherwise the `Admin` (the design
     /// doc's v1 default).
@@ -4967,23 +4998,5 @@ impl IntentSettlement {
         preimage.extend_from_array(&timestamp.to_be_bytes());
         preimage.extend_from_array(&nonce.to_be_bytes());
         env.crypto().sha256(&preimage).into()
-    }
-
-    fn validate_proof(env: &Env, intent_id: &BytesN<32>, intent: &IntentRecord) {
-        let _registry_addr = env
-            .storage()
-            .instance()
-            .get::<_, Address>(&DataKey::ProofRegistry)
-            .unwrap_or_else(|| panic_with_error!(env, Error::ProofRegistryNotSet));
-
-        // In production, this would call:
-        // - registry.has_proof(intent_id) to check existence
-        // - registry.get_proof(intent_id) to retrieve the proof record
-        // - Validate proof.src_chain matches intent.src_chain
-        // - Validate proof.src_amount >= intent.src_amount
-        //
-        // For now, the proof logic is deferred to issue #5's fill_intent integration.
-        // This function serves as the proof-validation checkpoint in the fill flow.
-        // Tests will inject mock proofs and verify this gate works correctly.
     }
 }
