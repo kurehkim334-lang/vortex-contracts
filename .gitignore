@@ -86,3 +86,6 @@ perf.data*
 *.tmp
 *.bak
 *.orig
+
+# Quint ITF trace files (generated; not committed — see spec/traces/README.md)
+spec/traces/*.itf.json
